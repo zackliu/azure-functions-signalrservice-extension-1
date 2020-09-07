@@ -2,117 +2,199 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Runtime.CompilerServices;
+using System.Linq;
 using System.Security.Claims;
-using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using Microsoft.IdentityModel.Tokens;
-using Newtonsoft.Json;
 
-[assembly:InternalsVisibleTo("SignalRServiceExtension.Tests")]
 namespace Microsoft.Azure.WebJobs.Extensions.SignalRService
 {
-    internal class AzureSignalRClient : IAzureSignalRClient
+    /// <summary>
+    /// AzureSignalRClient used for negotiation, publishing messages and managing group membership.
+    /// It will be created for each function request.
+    /// </summary>
+    internal class AzureSignalRClient : IAzureSignalRSender
     {
-        private readonly HttpClient httpClient;
-
-        internal string BaseEndpoint { get; }
-        internal string AccessKey { get; }
-
-        internal AzureSignalRClient(string connectionString, HttpClient httpClient)
+        public const string AzureSignalRUserPrefix = "asrs.u.";
+        private static readonly string[] SystemClaims =
         {
-            (BaseEndpoint, AccessKey) = ParseConnectionString(connectionString);
-            this.httpClient = httpClient;
+            "aud", // Audience claim, used by service to make sure token is matched with target resource.
+            "exp", // Expiration time claims. A token is valid only before its expiration time.
+            "iat", // Issued At claim. Added by default. It is not validated by service.
+            "nbf"  // Not Before claim. Added by default. It is not validated by service.
+        };
+        private readonly IServiceManagerStore serviceManagerStore;
+        private readonly string connectionString;
+
+        public string HubName { get; }
+
+        internal AzureSignalRClient(IServiceManagerStore serviceManagerStore, string connectionString, string hubName)
+        {
+            this.serviceManagerStore = serviceManagerStore;
+            this.HubName = hubName;
+            this.connectionString = connectionString;
         }
 
-        internal SignalRConnectionInfo GetClientConnectionInfo(string hubName)
+        public SignalRConnectionInfo GetClientConnectionInfo(string userId, string idToken, string[] claimTypeList)
         {
-            var hubUrl = $"{BaseEndpoint}:5001/client/?hub={hubName}";
-            var token = GenerateJwtBearer(null, hubUrl, null, DateTime.UtcNow.AddMinutes(30), AccessKey);
+            var customerClaims = GetCustomClaims(idToken, claimTypeList);
+            var serviceManager = serviceManagerStore.GetOrAddByConnectionString(connectionString).ServiceManager;
+
             return new SignalRConnectionInfo
             {
-                Url = hubUrl,
-                AccessToken = token
+                Url = serviceManager.GetClientEndpoint(HubName),
+                AccessToken = serviceManager.GenerateClientAccessToken(
+                    HubName, userId, BuildJwtClaims(customerClaims, AzureSignalRUserPrefix).ToList())
             };
         }
 
-        internal SignalRConnectionInfo GetServerConnectionInfo(string hubName)
+        public SignalRConnectionInfo GetClientConnectionInfo(string userId, IList<Claim> claims)
         {
-            var hubUrl = $"{BaseEndpoint}:5002/api/v1-preview/hub/{hubName}";
-            var token = GenerateJwtBearer(null, hubUrl, null, DateTime.UtcNow.AddMinutes(30), AccessKey);
+            var serviceManager = serviceManagerStore.GetOrAddByConnectionString(connectionString).ServiceManager;
             return new SignalRConnectionInfo
             {
-                Url = hubUrl,
-                AccessToken = token
+                Url = serviceManager.GetClientEndpoint(HubName),
+                AccessToken = serviceManager.GenerateClientAccessToken(
+                    HubName, userId, BuildJwtClaims(claims, AzureSignalRUserPrefix).ToList())
             };
         }
 
-        public Task SendMessage(string hubName, SignalRMessage message)
+        public IList<Claim> GetCustomClaims(string idToken, string[] claimTypeList)
         {
-            var connectionInfo = GetServerConnectionInfo(hubName);
-            return PostJsonAsync(connectionInfo.Url, message, connectionInfo.AccessToken);
+            var customClaims = new List<Claim>();
+
+            if (idToken != null && claimTypeList != null && claimTypeList.Length > 0)
+            {
+                var jwtToken = new JwtSecurityTokenHandler().ReadJwtToken(idToken);
+                foreach (var claim in jwtToken.Claims)
+                {
+                    if (claimTypeList.Contains(claim.Type))
+                    {
+                        customClaims.Add(claim);
+                    }
+                }
+            }
+
+            return customClaims;
         }
 
-        private (string EndPoint, string AccessKey) ParseConnectionString(string connectionString)
+        public async Task SendToAll(SignalRData data)
         {
-            if (string.IsNullOrEmpty(connectionString))
-            {
-                throw new ArgumentException("SignalR Service connection string is empty");
-            }
-
-            var endpointMatch = Regex.Match(connectionString, @"endpoint=([^;]+)", RegexOptions.IgnoreCase);
-            if (!endpointMatch.Success)
-            {
-                throw new ArgumentException("No endpoint present in SignalR Service connection string");
-            }
-            var accessKeyMatch = Regex.Match(connectionString, @"accesskey=([^;]+)", RegexOptions.IgnoreCase);
-            if (!accessKeyMatch.Success)
-            {
-                throw new ArgumentException("No access key present in SignalR Service connection string");
-            }
-
-            return (endpointMatch.Groups[1].Value, accessKeyMatch.Groups[1].Value);
+            var serviceHubContext = await serviceManagerStore.GetOrAddByConnectionString(connectionString).GetAsync(HubName);
+            await serviceHubContext.Clients.All.SendCoreAsync(data.Target, data.Arguments);
         }
 
-        private string GenerateJwtBearer(string issuer, string audience, ClaimsIdentity subject, DateTime? expires, string signingKey)
+        public async Task SendToConnection(string connectionId, SignalRData data)
         {
-            SigningCredentials credentials = null;
-            if (!string.IsNullOrEmpty(signingKey))
-            {
-                var securityKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(signingKey));
-                credentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
-            }
-            var jwtTokenHandler = new JwtSecurityTokenHandler();
-            var token = jwtTokenHandler.CreateJwtSecurityToken(
-                issuer: issuer,
-                audience: audience,
-                subject: subject,
-                expires: expires,
-                signingCredentials: credentials);
-            return jwtTokenHandler.WriteToken(token);
+            var serviceHubContext = await serviceManagerStore.GetOrAddByConnectionString(connectionString).GetAsync(HubName);
+            await serviceHubContext.Clients.Client(connectionId).SendCoreAsync(data.Target, data.Arguments);
         }
 
-        private Task<HttpResponseMessage> PostJsonAsync(string url, object body, string bearer)
+        public async Task SendToUser(string userId, SignalRData data)
         {
-            var request = new HttpRequestMessage
+            if (string.IsNullOrEmpty(userId))
             {
-                Method = HttpMethod.Post,
-                RequestUri = new Uri(url)
-            };
+                throw new ArgumentException($"{nameof(userId)} cannot be null or empty");
+            }
+            var serviceHubContext = await serviceManagerStore.GetOrAddByConnectionString(connectionString).GetAsync(HubName);
+            await serviceHubContext.Clients.User(userId).SendCoreAsync(data.Target, data.Arguments);
+        }
 
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearer);
-            request.Headers.Accept.Clear();
-            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-            request.Headers.AcceptCharset.Clear();
-            request.Headers.AcceptCharset.Add(new StringWithQualityHeaderValue("UTF-8"));
+        public async Task SendToGroup(string groupName, SignalRData data)
+        {
+            if (string.IsNullOrEmpty(groupName))
+            {
+                throw new ArgumentException($"{nameof(groupName)} cannot be null or empty");
+            }
+            var serviceHubContext = await serviceManagerStore.GetOrAddByConnectionString(connectionString).GetAsync(HubName);
+            await serviceHubContext.Clients.Group(groupName).SendCoreAsync(data.Target, data.Arguments);
+        }
 
-            var content = JsonConvert.SerializeObject(body);
-            request.Content = new StringContent(content, Encoding.UTF8, "application/json");
-            return httpClient.SendAsync(request);
+        public async Task AddUserToGroup(string userId, string groupName)
+        {
+            if (string.IsNullOrEmpty(userId))
+            {
+                throw new ArgumentException($"{nameof(userId)} cannot be null or empty");
+            }
+            if (string.IsNullOrEmpty(groupName))
+            {
+                throw new ArgumentException($"{nameof(groupName)} cannot be null or empty");
+            }
+            var serviceHubContext = await serviceManagerStore.GetOrAddByConnectionString(connectionString).GetAsync(HubName);
+            await serviceHubContext.UserGroups.AddToGroupAsync(userId, groupName);
+        }
+
+        public async Task RemoveUserFromGroup(string userId, string groupName)
+        {
+            if (string.IsNullOrEmpty(userId))
+            {
+                throw new ArgumentException($"{nameof(userId)} cannot be null or empty");
+            }
+            if (string.IsNullOrEmpty(groupName))
+            {
+                throw new ArgumentException($"{nameof(groupName)} cannot be null or empty");
+            }
+            var serviceHubContext = await serviceManagerStore.GetOrAddByConnectionString(connectionString).GetAsync(HubName);
+            await serviceHubContext.UserGroups.RemoveFromGroupAsync(userId, groupName);
+        }
+
+        public async Task RemoveUserFromAllGroups(string userId)
+        {
+            if (string.IsNullOrEmpty(userId))
+            {
+                throw new ArgumentException($"{nameof(userId)} cannot be null or empty");
+            }
+            var serviceHubContext = await serviceManagerStore.GetOrAddByConnectionString(connectionString).GetAsync(HubName);
+            await serviceHubContext.UserGroups.RemoveFromAllGroupsAsync(userId);
+        }
+
+        public async Task AddConnectionToGroup(string connectionId, string groupName)
+        {
+            if (string.IsNullOrEmpty(connectionId))
+            {
+                throw new ArgumentException($"{nameof(connectionId)} cannot be null or empty");
+            }
+            if (string.IsNullOrEmpty(groupName))
+            {
+                throw new ArgumentException($"{nameof(groupName)} cannot be null or empty");
+            }
+            var serviceHubContext = await serviceManagerStore.GetOrAddByConnectionString(connectionString).GetAsync(HubName);
+            await serviceHubContext.Groups.AddToGroupAsync(connectionId, groupName);
+        }
+
+        public async Task RemoveConnectionFromGroup(string connectionId, string groupName)
+        {
+            if (string.IsNullOrEmpty(connectionId))
+            {
+                throw new ArgumentException($"{nameof(connectionId)} cannot be null or empty");
+            }
+            if (string.IsNullOrEmpty(groupName))
+            {
+                throw new ArgumentException($"{nameof(groupName)} cannot be null or empty");
+            }
+            var serviceHubContext = await serviceManagerStore.GetOrAddByConnectionString(connectionString).GetAsync(HubName);
+            await serviceHubContext.Groups.RemoveFromGroupAsync(connectionId, groupName);
+        }
+
+        private static IEnumerable<Claim> BuildJwtClaims(IEnumerable<Claim> customerClaims, string prefix)
+        {
+            if (customerClaims != null)
+            {
+                foreach (var claim in customerClaims)
+                {
+                    // Add AzureSignalRUserPrefix if customer's claim name is duplicated with SignalR system claims.
+                    // And split it when return from SignalR Service.
+                    if (SystemClaims.Contains(claim.Type))
+                    {
+                        yield return new Claim(prefix + claim.Type, claim.Value);
+                    }
+                    else
+                    {
+                        yield return claim;
+                    }
+                }
+            }
         }
     }
 }

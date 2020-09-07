@@ -1,13 +1,25 @@
-# Azure Functions bindings for Azure SignalR Service
+# Azure Functions Bindings for Azure SignalR Service
+
+## Build Status
+
+Travis: [![travis](https://travis-ci.org/Azure/azure-functions-signalrservice-extension.svg?branch=dev)](https://travis-ci.org/Azure/azure-functions-signalrservice-extension)
+
+## NuGet Packages
+
+Package Name | Target Framework | NuGet
+---|---|---
+Microsoft.Azure.WebJobs.Extensions.SignalRService | .NET Standard 2.0 | [![NuGet](https://img.shields.io/nuget/v/Microsoft.Azure.WebJobs.Extensions.SignalRService.svg)](https://www.nuget.org/packages/Microsoft.Azure.WebJobs.Extensions.SignalRService)
 
 ## Intro
 
-These bindings allow Azure Functions to integrate with Azure SignalR Service.
+These bindings allow Azure Functions to integrate with [Azure SignalR Service](http://aka.ms/signalr_service).
 
 ### Supported scenarios
 
 - Allow clients to serverlessly connect to a SignalR Service hub without requiring an ASP.NET Core backend
-- Use Azure Functions (any language supported by V2) to broadcast messages to all clients connected to a SignalR Service hub
+- Use Azure Functions (any language supported by V2) to broadcast messages to all clients connected to a SignalR Service hub.
+- Use Azure Functions (any language supported by V2) to send messages to a single user, or all the users in a group.
+- Use Azure Functions (any language supported by V2) to manage group users like add/remove a single user in a group.
 - Example scenarios include: broadcast messages to a SignalR Service hub on HTTP requests and events from Cosmos DB change feed, Event Hub, Event Grid, etc
 
 ### Bindings
@@ -18,7 +30,7 @@ These bindings allow Azure Functions to integrate with Azure SignalR Service.
 
 ### Current limitations
 
-- Only supports broadcasting at this time, cannot invoke methods on a subset of connections, users, or groups
+- Cannot invoke methods on a subset of connections.
 - Functions cannot be triggered by client invocation of server methods (clients need to call an HTTP endpoint or post messages to a Event Grid, etc, to trigger a function)
 
 ## Prerequisites
@@ -36,7 +48,7 @@ These bindings allow Azure Functions to integrate with Azure SignalR Service.
 1. In a new folder, create a new Azure Functions app.
     - `func init`
 1. Install this Functions extension.
-    - `func extensions install -p AzureAdvocates.WebJobs.Extensions.SignalRService -v 0.3.0-alpha`
+    - `func extensions install -p Microsoft.Azure.WebJobs.Extensions.SignalRService -v 1.0.0`
 
 ### Add application setting for SignalR connection string
 
@@ -49,7 +61,7 @@ These bindings allow Azure Functions to integrate with Azure SignalR Service.
 In order for a client to connect to SignalR, it needs to obtain the SignalR Service client hub URL and an access token.
 
 1. Create a new function named `negotiate` and use the `SignalRConnectionInfo` input binding to obtain the connection information and return it. Take a look at this [sample](samples/simple-chat/js/functionapp/negotiate/).
-1. Before connecting to the SignalR Service, the client needs to call this function to obtain the endpoint URL and access token. See [this file](samples/simple-chat/content/index.html) for a sample usage.
+1. Client connects to the `negotiate` function as it's a normal SignalR hub. See [this file](samples/simple-chat/content/index.html) for a sample usage.
 
 Binding schema:
 
@@ -99,7 +111,7 @@ module.exports = function (context, req) {
 };
 ```
 
-# Contributing
+## Contributing
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
 Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us

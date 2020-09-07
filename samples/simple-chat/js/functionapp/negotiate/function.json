@@ -15,6 +15,7 @@
     {
       "type": "signalRConnectionInfo",
       "name": "connectionInfo",
+      "userId": "{headers.x-ms-signalr-userid}",
       "hubName": "simplechat",
       "direction": "in"
     }

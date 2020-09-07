@@ -2,39 +2,53 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Azure.SignalR.Management;
 using Microsoft.Azure.WebJobs.Description;
+using Microsoft.Azure.WebJobs.Host.Bindings;
 using Microsoft.Azure.WebJobs.Host.Config;
 using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Extensions.SignalRService
 {
-    [Extension("SignalR")]
-    internal class SignalRConfigProvider : IExtensionConfigProvider
+    [Extension("SignalR", "signalr")]
+    internal class SignalRConfigProvider : IExtensionConfigProvider, IAsyncConverter<HttpRequestMessage, HttpResponseMessage>
     {
-        internal const string AzureSignalRConnectionStringName = "AzureSignalRConnectionString";
-
-        private readonly SignalROptions options;
+        private readonly IConfiguration configuration;
         private readonly INameResolver nameResolver;
-        private readonly IHttpClientFactory httpClientFactory;
         private readonly ILogger logger;
+        private readonly SignalROptions options;
+        private readonly ILoggerFactory loggerFactory;
+        private readonly ISignalRTriggerDispatcher _dispatcher;
+        private readonly InputBindingProvider inputBindingProvider;
 
         public SignalRConfigProvider(
-            IOptions<SignalROptions> options, 
-            INameResolver nameResolver, 
-            ILoggerFactory loggerFactory, 
-            IHttpClientFactory httpClientFactory)
+            IOptions<SignalROptions> options,
+            INameResolver nameResolver,
+            ILoggerFactory loggerFactory,
+            IConfiguration configuration,
+            ISecurityTokenValidator securityTokenValidator = null,
+            ISignalRConnectionInfoConfigurer signalRConnectionInfoConfigurer = null)
         {
             this.options = options.Value;
-            this.logger = loggerFactory.CreateLogger("SignalR");
+            this.loggerFactory = loggerFactory;
+            this.logger = loggerFactory.CreateLogger(LogCategories.CreateTriggerCategory("SignalR"));
             this.nameResolver = nameResolver;
-            this.httpClientFactory = httpClientFactory;
+            this.configuration = configuration;
+            this._dispatcher = new SignalRTriggerDispatcher();
+            inputBindingProvider = new InputBindingProvider(configuration, nameResolver, securityTokenValidator, signalRConnectionInfoConfigurer);
         }
-        
+
+        // GetWebhookHandler() need the Obsolete
+        [Obsolete("preview")]
         public void Initialize(ExtensionConfigContext context)
         {
             if (context == null)
@@ -44,66 +58,95 @@ namespace Microsoft.Azure.WebJobs.Extensions.SignalRService
 
             if (string.IsNullOrEmpty(options.ConnectionString))
             {
-                options.ConnectionString = nameResolver.Resolve(AzureSignalRConnectionStringName);
+                options.ConnectionString = nameResolver.Resolve(Constants.AzureSignalRConnectionStringName);
             }
 
-            context.AddConverter<string, JObject>(JObject.FromObject);
-            context.AddConverter<JObject, SignalRMessage>(input => input.ToObject<SignalRMessage>());
-            context.AddConverter<SignalRConnectionInfo, JObject>(JObject.FromObject);
+            var serviceTransportTypeStr = nameResolver.Resolve(Constants.ServiceTransportTypeName);
+            if (Enum.TryParse<ServiceTransportType>(serviceTransportTypeStr, out var transport))
+            {
+                options.AzureSignalRServiceTransportType = transport;
+            }
+            else
+            {
+                logger.LogWarning($"Unsupported service transport type: {serviceTransportTypeStr}. Use default {options.AzureSignalRServiceTransportType} instead.");
+            }
 
+            StaticServiceHubContextStore.ServiceManagerStore = new ServiceManagerStore(options.AzureSignalRServiceTransportType, configuration, loggerFactory);
+
+            var url = context.GetWebhookHandler();
+            logger.LogInformation($"Registered SignalR trigger Endpoint = {url?.GetLeftPart(UriPartial.Path)}");
+
+            context.AddConverter<string, JObject>(JObject.FromObject)
+                   .AddConverter<SignalRConnectionInfo, JObject>(JObject.FromObject)
+                   .AddConverter<JObject, SignalRMessage>(input => input.ToObject<SignalRMessage>())
+                   .AddConverter<JObject, SignalRGroupAction>(input => input.ToObject<SignalRGroupAction>());
+
+            // Trigger binding rule
+            var triggerBindingRule = context.AddBindingRule<SignalRTriggerAttribute>();
+            triggerBindingRule.AddConverter<InvocationContext, JObject>(JObject.FromObject);
+            triggerBindingRule.BindToTrigger<InvocationContext>(new SignalRTriggerBindingProvider(_dispatcher, nameResolver, options));
+
+            // Non-trigger binding rule
             var signalRConnectionInfoAttributeRule = context.AddBindingRule<SignalRConnectionInfoAttribute>();
             signalRConnectionInfoAttributeRule.AddValidator(ValidateSignalRConnectionInfoAttributeBinding);
-            signalRConnectionInfoAttributeRule.BindToInput<SignalRConnectionInfo>(GetClientConnectionInfo);
+            signalRConnectionInfoAttributeRule.Bind(inputBindingProvider);
+
+            var securityTokenValidationAttributeRule = context.AddBindingRule<SecurityTokenValidationAttribute>();
+            securityTokenValidationAttributeRule.Bind(inputBindingProvider);
 
             var signalRAttributeRule = context.AddBindingRule<SignalRAttribute>();
             signalRAttributeRule.AddValidator(ValidateSignalRAttributeBinding);
-            signalRAttributeRule.BindToCollector<SignalRMessage>(CreateCollector);
+            signalRAttributeRule.BindToCollector<SignalROpenType>(typeof(SignalRCollectorBuilder<>), options);
 
             logger.LogInformation("SignalRService binding initialized");
+        }
+
+        public Task<HttpResponseMessage> ConvertAsync(HttpRequestMessage input, CancellationToken cancellationToken)
+        {
+            return _dispatcher.ExecuteAsync(input, cancellationToken);
         }
 
         private void ValidateSignalRAttributeBinding(SignalRAttribute attribute, Type type)
         {
             ValidateConnectionString(
-                attribute.ConnectionStringSetting, 
+                attribute.ConnectionStringSetting,
                 $"{nameof(SignalRAttribute)}.{nameof(SignalRAttribute.ConnectionStringSetting)}");
         }
 
         private void ValidateSignalRConnectionInfoAttributeBinding(SignalRConnectionInfoAttribute attribute, Type type)
         {
             ValidateConnectionString(
-                attribute.ConnectionStringSetting, 
+                attribute.ConnectionStringSetting,
                 $"{nameof(SignalRConnectionInfoAttribute)}.{nameof(SignalRConnectionInfoAttribute.ConnectionStringSetting)}");
         }
 
         private void ValidateConnectionString(string attributeConnectionString, string attributeConnectionStringName)
         {
-            var connectionString = FirstOrDefault(attributeConnectionString, options.ConnectionString);
+            var connectionString = Utils.FirstOrDefault(attributeConnectionString, options.ConnectionString);
 
             if (string.IsNullOrEmpty(connectionString))
             {
-                throw new InvalidOperationException(
-                    $"The SignalR Service connection string must be set either via an '{AzureSignalRConnectionStringName}' app setting, via an '{AzureSignalRConnectionStringName}' environment variable, or directly in code via {nameof(SignalROptions)}.{nameof(SignalROptions.ConnectionString)} or {attributeConnectionStringName}.");
+                throw new InvalidOperationException(string.Format(ErrorMessages.EmptyConnectionStringErrorMessageFormat, attributeConnectionStringName));
             }
         }
 
-        private IAsyncCollector<SignalRMessage> CreateCollector(SignalRAttribute attribute)
+        private class SignalROpenType : OpenType.Poco
         {
-            var connectionString = FirstOrDefault(attribute.ConnectionStringSetting, options.ConnectionString);
-            var hubName = FirstOrDefault(attribute.HubName, options.HubName);
-            var client = new AzureSignalRClient(connectionString, httpClientFactory.CreateClient());
-            return new SignalRMessageAsyncCollector(client, hubName);
-        }
+            public override bool IsMatch(Type type, OpenTypeMatchContext context)
+            {
+                if (type.IsGenericType
+                    && type.GetGenericTypeDefinition() == typeof(IEnumerable<>))
+                {
+                    return false;
+                }
 
-        private SignalRConnectionInfo GetClientConnectionInfo(SignalRConnectionInfoAttribute attribute)
-        {
-            var signalR = new AzureSignalRClient(attribute.ConnectionStringSetting, httpClientFactory.CreateClient());
-            return signalR.GetClientConnectionInfo(attribute.HubName);
-        }
+                if (type.FullName == "System.Object")
+                {
+                    return true;
+                }
 
-        private string FirstOrDefault(params string[] values)
-        {
-            return values.FirstOrDefault(v => !string.IsNullOrEmpty(v));
+                return base.IsMatch(type, context);
+            }
         }
     }
 }

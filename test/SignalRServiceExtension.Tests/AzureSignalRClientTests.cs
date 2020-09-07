@@ -1,14 +1,12 @@
-﻿// Copyright (c) Microsoft. All rights reserved.
+// Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
-using System;
-using System.Net.Http;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Collections.Generic;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Security.Claims;
+using Microsoft.Azure.SignalR.Management;
 using Microsoft.Azure.WebJobs.Extensions.SignalRService;
-using Newtonsoft.Json;
-using SignalRServiceExtension.Tests.Utils;
 using Xunit;
 
 namespace SignalRServiceExtension.Tests
@@ -16,86 +14,31 @@ namespace SignalRServiceExtension.Tests
     public class AzureSignalRClientTests
     {
         [Fact]
-        public void AzureSignalRClient_ParsesConnectionString()
+        public void GetClientConnectionInfo()
         {
-            var azureSignalR = new AzureSignalRClient("Endpoint=https://foo.service.signalr.net;AccessKey=/abcdefghijklmnopqrstu/v/wxyz11111111111111=;", null);
-            Assert.Equal("https://foo.service.signalr.net", azureSignalR.BaseEndpoint);
-            Assert.Equal("/abcdefghijklmnopqrstu/v/wxyz11111111111111=", azureSignalR.AccessKey);
+            var hubName = "TestHub";
+            var hubUrl = "http://localhost";
+            var accessKey = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            var connectionString = $"Endpoint={hubUrl};AccessKey={accessKey};Version=1.0;";
+            var userId = "User";
+            var idToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+            var expectedName = "John Doe";
+            var expectedIat = "1516239022";
+            var claimTypeList = new string[] { "name", "iat" };
+            var serviceManagerStore = new ServiceManagerStore(ServiceTransportType.Transient, null, null);
+            var azureSignalRClient = new AzureSignalRClient(serviceManagerStore, connectionString, hubName);
+            var connectionInfo = azureSignalRClient.GetClientConnectionInfo(userId, idToken, claimTypeList);
+
+            Assert.Equal(connectionInfo.Url, $"{hubUrl}/client/?hub={hubName.ToLower()}");
+
+            var claims = new JwtSecurityTokenHandler().ReadJwtToken(connectionInfo.AccessToken).Claims;
+            Assert.Equal(expectedName, GetClaimValue(claims, "name"));
+            Assert.Equal(expectedIat, GetClaimValue(claims, $"{AzureSignalRClient.AzureSignalRUserPrefix}iat"));
         }
 
-        [Fact]
-        public void AzureSignalRClient_GetClientConnectionInfo_ReturnsValidInfo()
-        {
-            var azureSignalR = new AzureSignalRClient("Endpoint=https://foo.service.signalr.net;AccessKey=/abcdefghijklmnopqrstu/v/wxyz11111111111111=;", null);
-
-            var info = azureSignalR.GetClientConnectionInfo("chat");
-
-            const string expectedUrl = "https://foo.service.signalr.net:5001/client/?hub=chat";
-            TestHelpers.EnsureValidAccessToken(
-                audience: expectedUrl,
-                signingKey: "/abcdefghijklmnopqrstu/v/wxyz11111111111111=", 
-                accessToken: info.AccessToken);
-            Assert.Equal(expectedUrl, info.Url);
-        }
-
-        [Fact]
-        public void AzureSignalRClient_GetServerConnectionInfo_ReturnsValidInfo()
-        {
-            var azureSignalR = new AzureSignalRClient("Endpoint=https://foo.service.signalr.net;AccessKey=/abcdefghijklmnopqrstu/v/wxyz11111111111111=;", null);
-
-            var info = azureSignalR.GetServerConnectionInfo("chat");
-
-            const string expectedUrl = "https://foo.service.signalr.net:5002/api/v1-preview/hub/chat";
-            TestHelpers.EnsureValidAccessToken(
-                audience: expectedUrl,
-                signingKey: "/abcdefghijklmnopqrstu/v/wxyz11111111111111=", 
-                accessToken: info.AccessToken);
-            Assert.Equal(expectedUrl, info.Url);
-        }
-
-        [Fact]
-        public async Task SendMessage_CallsAzureSignalRService()
-        {
-            var connectionString = "Endpoint=https://foo.service.signalr.net;AccessKey=/abcdefghijklmnopqrstu/v/wxyz11111111111111=;";
-            var hubName = "chat";
-            var requestHandler = new FakeHttpMessageHandler();
-            var httpClient = new HttpClient(requestHandler);
-            var azureSignalR = new AzureSignalRClient(connectionString, httpClient);
-
-            await azureSignalR.SendMessage(hubName, new SignalRMessage
-            {
-                Target = "newMessage",
-                Arguments = new object[] { "arg1", "arg2" }
-            });
-
-            const string expectedEndpoint = "https://foo.service.signalr.net:5002/api/v1-preview/hub/chat";
-            var request = requestHandler.HttpRequestMessage;
-            Assert.Equal("application/json", request.Content.Headers.ContentType.MediaType);
-            Assert.Equal(expectedEndpoint, request.RequestUri.AbsoluteUri);
-
-            var actualRequestBody = JsonConvert.DeserializeObject<SignalRMessage>(await request.Content.ReadAsStringAsync());
-            Assert.Equal("newMessage", actualRequestBody.Target);
-            Assert.Equal("arg1", actualRequestBody.Arguments[0]);
-            Assert.Equal("arg2", actualRequestBody.Arguments[1]);
-
-            var authorizationHeader = request.Headers.Authorization;
-            Assert.Equal("Bearer", authorizationHeader.Scheme);
-            TestHelpers.EnsureValidAccessToken(
-                audience: expectedEndpoint,
-                signingKey: "/abcdefghijklmnopqrstu/v/wxyz11111111111111=", 
-                accessToken: authorizationHeader.Parameter);
-        }
-
-        private class FakeHttpMessageHandler : HttpMessageHandler
-        {
-            public HttpRequestMessage HttpRequestMessage { get; private set; }
-            protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
-            {
-                HttpRequestMessage = request;
-                var response = new HttpResponseMessage(System.Net.HttpStatusCode.ServiceUnavailable);
-                response.Content = new StringContent("", Encoding.UTF8, "application/json");
-                return Task.FromResult(response);
-            }
-        }
+        private string GetClaimValue(IEnumerable<Claim> claims, string type) =>
+            (from c in claims
+             where c.Type == type
+             select c.Value).FirstOrDefault();
     }
 }
